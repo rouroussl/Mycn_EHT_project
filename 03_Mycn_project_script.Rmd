@@ -1,0 +1,1104 @@
+---
+title: "Single-cell data processing workflow"
+author: "ccz"
+date: "2026-06-09"
+output: html_document
+---
+
+```{r package}
+#R 4.1.3
+library(Seurat)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(ggpubr)
+library(SeuratExtend)
+library(monocle)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(GSEABase)
+library(rio)
+library(DoubletFinder)
+library(JASPAR2024)
+library(motifmatchr)
+library(TFBSTools)
+library(EnsDb.Mmusculus.v79)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(GenomicRanges)
+library(xgboost)
+library(hdWGCNA)
+```
+#QC
+##1_STRT_Seq
+```{r}
+Mycn <- fread("/data/ccz/project/project_chiw_myc/out_smart/outs/refgene.refgenev3.umi.txt")#data.table
+EGCC <- import("/data/Common_Data/ref/ERCC/ERCC92_RGC.gtf")
+Mycn %<>%as.data.frame() 
+rownames(Mycn) <- Mycn$gene_symbol
+Mycn <- Mycn[,-1]
+ID <- EGCC$gene_id
+ERCC <- grep("^ERCC",rownames(Mycn),value = T)
+mycn <-Mycn[!rownames(Mycn)%in%ERCC,] 
+mycn_seu <- CreateSeuratObject(mycn)
+VlnPlot(mycn_seu,features = c("nCount_RNA","nFeature_RNA"))
+mycn_seu[["percent_mt"]] <- PercentageFeatureSet(mycn_seu,pattern = "^mt-")
+summary(mycn$nCount_RNA,quantiles = c(0.25, 0.75))
+mycn <- subset(mycn_seu,nCount_RNA > 2000&nCount_RNA<1e+06&nFeature_RNA>1000)
+mycn$genotype <- mycn$orig.ident
+mycn$stage <- 'E10.0'
+mycn$batch <- 'STRT-seq'
+```
+##2_10X
+```{r}
+data <- Read10X('./hash_result/outs/filtered_feature_bc_matrix/')
+antibody_data <- data$`Antibody Capture` %>% as.data.frame()
+hto_data <- antibody_data[c('HTO1','HTO2','HTO3'),]
+antibody_data <- antibody_data[c('CD201','c-Kit'),]
+umi <- data$`Gene Expression`
+hto_mycn <- hto_data[colSums(hto_data)>0]
+join_data <- intersect(colnames(umi),colnames(hto_mycn))
+umi <- umi[,join_data]
+hto_mycn <- as.matrix(hto_mycn[,join_data])
+mycn <- CreateSeuratObject(counts = umi)
+mycn[['HTO']] <- CreateAssayObject(counts = hto_mycn)
+mycn <- NormalizeData(mycn,assay = 'HTO',normalization.method = 'CLR')
+mycn <- HTODemux(mycn,assay = 'HTO',positive.quantile = 0.99)
+table(mycn$HTO_classification.global)
+Idents(mycn) <- mycn$HTO_classification.global
+mycn_data <- subset(mycn,idents = 'Singlet')
+mycn_data$batch <- '2_10X'
+mycn_data$stage <- "E10.5-E11"
+mycn_data$genotype <- plyr::mapvalues(mycn_data$hash.ID,from = c("HTO1","HTO2","HTO3"),to=c("WT","KO1","KO2"))
+mycn_ <- CreateSeuratObject(counts = GetAssayData(mycn_data,assay = 'RNA',slot = 'counts'),meta.data = mycn_data@meta.data,min.cells = 3,min.features = 200)
+mycn_[['percent.mt']] <- PercentageFeatureSet(mycn_,pattern = '^mt-')
+mycn_sub <- subset(mycn_,subset = nCount_RNA>5000&nFeature_RNA>1000&percent.mt<10)
+mycn_sub %<>%NormalizeData() %>% FindVariableFeatures() %>% ScaleData() %>% RunPCA() %>% RunUMAP(dims = 1:20) %>% FindNeighbors(dims = 1:20) %>% FindClusters(resolution = 0.8)
+
+#finddoubler
+sweep.res.list <- DoubletFinder::paramSweep_v3(mycn_sub, PCs = 1:30, sct = FALSE)
+sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+sweep.stats
+bcmvn <- find.pK(sweep.stats)
+mpK <- as.numeric(as.vector(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+homotypic.prop <- modelHomotypic(mycn_sub$RNA_snn_res.0.8)          
+nExp_poi <- round(0.075*ncol(mycn_sub))
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+mycn_sub <- doubletFinder_v3(mycn_sub, PCs = 1:30, pN = 0.25, pK = mpK, nExp = nExp_poi, reuse.pANN = FALSE, sct = FALSE)
+Idents(mycn_sub) <- mycn_sub$DF.classifications_0.25_0.03_181
+mycn_dou <- subset(mycn_sub,idents = 'Singlet')
+mycn_dou$batch <- '2_10X'
+```
+##3_10X
+```{r}
+new_data <- Read10X("/home/chenzhe/project/mycn_data/3_data/filtered_feature_bc_matrix/")
+new_mycn_seu <- CreateSeuratObject(counts = new_data$`Gene Expression`)
+new_mycn_seu[['HTO']] = CreateAssayObject(counts = new_data$`Antibody Capture`)
+DefaultAssay(new_mycn_seu) <- 'RNA'
+new_mycn_seu %<>% NormalizeData() %>% FindVariableFeatures() %>% ScaleData() 
+new_mycn_seu <- NormalizeData(new_mycn_seu, assay = "HTO", normalization.method = "CLR")
+new_mycn_seu <- HTODemux(new_mycn_seu, assay = "HTO", positive.quantile = 0.99)
+new_mycn_seu_sub <- subset(new_mycn_seu,idents=c("Negative","Doublet"),invert=TRUE)
+new_mycn_seu_sub %<>% NormalizeData() %>% FindVariableFeatures() %>% ScaleData() %>% RunPCA() %>% RunUMAP(dims = 1:20) 
+new_mycn_seu_sub[["percent.mt"]] <- PercentageFeatureSet(new_mycn_seu_sub, pattern = "^mt-")
+
+VlnPlot2(new_mycn_seu_sub,features = c("nCount_RNA","nFeature_RNA","percent.mt"),group.by = 'hash.ID')
+DimPlot(new_mycn_seu_sub,group.by = "hash.ID")
+FeaturePlot(new_mycn_seu_sub,features = c('Cdh5','Gja5','Runx1','Kitl'))
+new_sample <- CreateSeuratObject(counts = new_mycn_seu_sub@assays$RNA@counts,
+                                   meta.data = new_mycn_seu_sub@meta.data,
+                                   min.cells = 3,
+                                   min.features = 200)
+new_sample %<>% NormalizeData() 
+new_sample[["percent.mt"]] <- PercentageFeatureSet(new_sample, pattern = "^mt-")
+VlnPlot2(new_sample,features = c("nCount_RNA","nFeature_RNA","percent.mt"),group.by='hash.ID')
+new_sample <- subset(new_sample,nCount_RNA<75000&nFeature_RNA>500&percent.mt<5)
+new_sample %<>% NormalizeData() %>% FindVariableFeatures() %>% ScaleData() %>% RunPCA() %>% RunUMAP(dims = 1:30) %>% FindNeighbors(dims = 1:30) %>% FindClusters(resolution = 1)
+sweep.res <- paramSweep_v3(new_sample, PCs = 1:20)
+sweep.stats_object <- summarizeSweep(sweep.res, GT = FALSE)
+bcmvn <- find.pK(sweep.stats_object)
+pK_bcmvn <- bcmvn$pK[which.max(bcmvn$BCmetric)] %>% as.numeric()
+pK_bcmvn <- as.numeric(bcmvn$pK[which.max(bcmvn$BCmetric)])
+annotations <- new_sample@meta.data$RNA_snn_res.1
+homotypic.prop <- modelHomotypic(annotations)
+nExp_poi <- round(0.07 * nrow(new_sample@meta.data))
+nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+new_sample <- doubletFinder_v3(new_sample, PCs = 1:20, pN = 0.25, pK = pK_bcmvn,
+                                  nExp = nExp_poi.adj, reuse.pANN = FALSE, sct = F)
+new_sample_filter <- new_sample[,new_sample$DF.classifications_0.25_17_256%in%'Singlet']
+counts <- new_sample_filter@assays$RNA@counts
+decontX_results <- decontX(counts)
+new_sample_filter$Contamination <- decontX_results$contamination
+new_sample_decont <- subset(new_sample_filter, subset = Contamination < 0.75)
+new_sample_decont %<>% NormalizeData() %>% CellCycleScoring(s.features = cc.genes$s.genes %>% tolower() %>% Hmisc::capitalize(),g2m.features = cc.genes$g2m.genes %>% tolower() %>%Hmisc::capitalize()) 
+list <- lapply(X =  SplitObject(new_sample_decont,split.by = 'hash.ID') , FUN = function(x) {
+    x <- NormalizeData(x)
+     x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 3000)
+  })
+features <- SelectIntegrationFeatures(object.list = list,nfeatures = 1800)
+cellcycle <- cor(FetchData(new_sample_decont,vars = features),FetchData(new_sample_decont,vars =c("S.Score","G2M.Score")))
+feature <- rownames(cellcycle)[rowSums(abs(cellcycle)>0.4)==0]
+anchors <- FindIntegrationAnchors(object.list = list, anchor.features = feature)
+new_sample_combined <- IntegrateData(anchorset = anchors)
+new_sample_combined %<>% ScaleData() %>% RunPCA()
+new_sample_combined$stage <- ifelse(new_sample_combined$hash.ID%in%c("E10-KO","E10-WT"),'E10','E9.5')
+new_sample_combined$genotype <- ifelse(new_sample_combined$hash.ID%in%c("E10-KO","E9-KO"),'KO','WT')
+new_sample_combined$batch <- '3_10X'
+
+```
+#Integrating multi-omics data for batch correction, dimensionality reduction, and clustering
+
+```{r}
+all_dat <- merge(new_sample_combined,y=list(mycn_dou,mycn))
+all_dat %<>% NormalizeData() %>% CellCycleScoring(s.features = cc.genes$s.genes %>% tolower() %>% Hmisc::capitalize(),g2m.features = cc.genes$g2m.genes %>% tolower() %>%Hmisc::capitalize()) 
+list <- lapply(X =  SplitObject(all_dat,split.by = 'stage') , FUN = function(x) {
+    x <- NormalizeData(x)
+     x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+  })
+features <- SelectIntegrationFeatures(object.list = list,nfeatures = 2000)
+cellcycle <- cor(FetchData(all_dat,vars = features),FetchData(all_dat,vars =c("S.Score","G2M.Score")))
+feature <- rownames(cellcycle)[rowSums(abs(cellcycle)>0.4)==0]
+anchors <- FindIntegrationAnchors(object.list = list, anchor.features = feature)
+all_combined <- IntegrateData(anchorset = anchors)
+all_combined %<>% ScaleData() %>% RunPCA()
+DefaultAssay(all_combined) <- "integrated"
+all_combined %<>% RunUMAP(dims = 1:40,min.dist = 0.5,n.neighbors = 15)  
+all_combined %<>% FindNeighbors(dims = 1:40) %>% FindClusters(resolution = 0.2)
+
+sub_all <- all_combined[,all_combined$integrated_snn_res.0.1%in%c('0','1','2','3','4','5','6')]##Remove the stromal population
+DefaultAssay(sub_all) <- 'RNA'
+sub_all %<>% NormalizeData() %>% CellCycleScoring(s.features = cc.genes$s.genes %>% tolower() %>% Hmisc::capitalize(),g2m.features = cc.genes$g2m.genes %>% tolower() %>%Hmisc::capitalize()) 
+list <- lapply(X =  SplitObject(sub_all,split.by = 'batch') , FUN = function(x) {
+    x <- NormalizeData(x)
+     x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 3000)
+  })
+features <- SelectIntegrationFeatures(object.list = list,nfeatures = 1800)
+cellcycle <- cor(FetchData(sub_all,vars = features),FetchData(sub_all,vars =c("S.Score","G2M.Score")))
+feature <- rownames(cellcycle)[rowSums(abs(cellcycle)>0.4)==0]
+anchors <- FindIntegrationAnchors(object.list = list, anchor.features = feature)
+sub_combined <- IntegrateData(anchorset = anchors)
+sub_combined %<>% ScaleData() %>% RunPCA()
+DefaultAssay(sub_combined) <- "integrated"
+sub_combined %<>% RunUMAP(dims = 1:30,min.dist = 0.6,n.neighbors =15) %>% FindNeighbors(dims = 1:40) %>% FindClusters(resolution = 0.5)
+sub_combined <- FindSubCluster(sub_combined,cluster = '3',graph.name = 'integrated_snn',resolution =0.3 ,subcluster.name = 'hspc.cluster')
+sub_combined$Cluster <- plyr::mapvalues(sub_combined$hspc.cluster,
+                                            from = sub_combined$hspc.cluster %>% unique(),
+                                            to=c('HSPC2','HEC','Mye prog.','AEC1','HSPC1','VEC','VEC','Mac','AEC2','MK','Lym prog.','VEC'))
+
+sub_combined$Cluster <- factor(sub_combined$Cluster,levels = c('VEC','AEC2','AEC1','HEC','HSPC1','HSPC2','Lym prog.','Mye prog.','Mac','MK'))
+```
+
+##Compare the difference in HSPC1 numbers
+```{r}
+counts_matrix <- matrix(
+  c( 636, 136, 127,   #Ctrl
+     812, 199, 114), #KO
+  nrow = 2,
+  byrow = TRUE
+)
+rownames(counts_matrix) <- c("Ctrl", "KO")
+colnames(counts_matrix) <- c("AEC1", "HEC", "HSPC1")
+
+target_cell <- "HSPC1"
+target_counts <- counts_matrix[, target_cell]       
+total_counts <- rowSums(counts_matrix)              
+other_counts <- total_counts - target_counts        
+
+test_data <- cbind(Target = target_counts, Others = other_counts)
+
+colnames(test_data)[1] <- target_cell 
+chisq_res <- chisq.test(test_data)
+
+
+```
+
+
+
+##monocle
+```{r}
+library(monocle)
+library(Seurat)
+library(dplyr)
+eht <- sub_combined[,sub_combined$celltype%in%c('HEC','HSPC1')]
+eht %<>% NormalizeData()
+p_data <- eht@meta.data
+# 提取基因信息
+f_data <- data.frame(gene_short_name  = row.names(eht),  row.names  = row.names(eht))  
+head(f_data)
+expr_matrix <- GetAssayData(object = eht, assay = "RNA", slot = "counts") 
+pd<- new('AnnotatedDataFrame', data = p_data)
+fd <- new('AnnotatedDataFrame', data = f_data)
+cds <- newCellDataSet(expr_matrix,
+                       phenoData = pd,
+                       featureData = fd,
+                       lowerDetectionLimit = 0.5,
+                       expressionFamily=negbinomial.size())
+cds <- estimateSizeFactors(cds)
+cds <- estimateDispersions(cds)
+cds <- detectGenes(cds, min_expr = 0.1) 
+Idents(eht) <- eht$celltype
+deg_eht <- FindAllMarkers(eht,only.pos = T,logfc.threshold = log2(1.6))
+cds <- setOrderingFilter(cds, deg_eht$gene)
+cds <- reduceDimension(cds, max_components = 2,reduction_method =  'DDRTree',residualModelFormulaStr = "~stage")
+cds <- orderCells(cds,reverse=T)
+p <- plot_cell_trajectory(cds, 
+                          color_by = "Pseudotime", 
+                          cell_size = 2, 
+                          cell_link_size = 1)
+p$layers[[2]]$mapping$shape <- aes(shape = celltype)$shape
+final_plot <- p + 
+  scale_shape_manual(values = c(17,16))+scale_color_viridis_c(option = "D", name = "Pseudotime",direction = -1)+
+  guides(shape = guide_legend(override.aes = list(size = 3))) +
+  theme_classic()
+
+final_plot
+
+p_celltype <- plot_cell_trajectory(cds, 
+                          color_by = "celltype", 
+                          cell_size = 2, 
+                          cell_link_size = 1)
+p_celltype$layers[[2]]$mapping$shape <- aes(shape = celltype)$shape
+final_plot_celltype <- p_celltype + 
+  scale_shape_manual(values = c(17,16))+scale_color_manual(values = c('#FF9800', '#E53935'))+
+  guides(shape = guide_legend(override.aes = list(size = 4))) +
+  theme_classic()+facet_wrap(~gGroup)
+
+final_plot_celltype
+```
+
+##Area chart
+```{r fig.width=6,fig.height=4}
+library(ggplot2)
+library(dplyr)
+library(scales) 
+plot_df <- pData(cds) 
+plot_df <- plot_df %>% 
+  filter(!is.infinite(Pseudotime)) %>%
+  filter(!is.na(gGroup)) 
+ggplot(plot_df, aes(x = Pseudotime, fill = gGroup)) +
+   geom_density(position = "fill", alpha = 0.9, adjust = 1.5, color = NA) + 
+  
+  scale_y_continuous(labels = scales::percent, expand = c(0, 0)) + 
+  scale_x_continuous(expand = c(0, 0)) + 
+  scale_fill_manual(values = c('#549ffa','#f84040')) +
+  labs(x = "Pseudotime", y = "Proportion of gGroup", fill = "Group") +
+  theme_classic() +
+  theme(
+    axis.text = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, face = "bold"),
+    legend.position = "right" 
+  )
+
+
+```
+
+##Visualizing single-cell knockout proportions
+```{r fig.width=4,fig.height=5}
+eht <- sub_combined[,c(sub_combined$celltype%in%c('AEC1','HEC','HSPC1')&sub_combined$pick%in%c('tCtrl','tHT','tKO'))]
+table(eht$gGroup,eht$new_gtGroup)
+
+plot_data <- eht@meta.data %>% 
+  group_by(gGroup, pick) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  group_by(gGroup) %>%
+  mutate(Percent = Count / sum(Count) * 100)
+ggplot(plot_data, aes(x = gGroup, y = Percent, fill = pick)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.7) +
+  geom_text(aes(label = paste0(Count, "\n(", round(Percent, 1), "%)")), 
+            position = position_stack(vjust = 0.5), 
+            size = 3.5, 
+            color = "white",    
+            fontface = "bold",  
+            lineheight = 0.9) + 
+  
+  theme_classic() +
+  labs(x = "gGroup", y = "Percentage (%)", fill = "Cluster") + 
+  scale_fill_manual(values = c('#795ff6','#00b2b3','#860162')) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12, face = "bold", color = "black"),
+    axis.text.y = element_text(size = 8, color = "black"),
+    axis.title = element_text(size = 14, face = "bold")
+  )
+```
+##HEC enrichment analysis
+```{r}
+Idents(sub_combined) <- sub_combined$g_tGroup
+hec_data <- sub_combined[,c(sub_combined$Cluster%in%'HEC'&sub_combined$g_tGroup%in%c('gKO_tKO','gCtrl_tCtrl'))]
+hec_data %<>% NormalizeData() 
+Idents(hec_data) <- hec_data$g_tGroup
+hec_deg <- FindMarkers(hec_data,ident.1 = 'gKO_tKO',ident.2 = 'gCtrl_tCtrl',logfc.threshold = log(1.3)) %>% dplyr::filter(p_val<0.05)
+hec_deg$cluster <- ifelse(hec_deg$avg_log2FC>0,'gKO_tKO','gCtrl_tCtrl')
+hec_deg$gene <- rownames(hec_deg)
+hec_go <- compareCluster(geneClusters = gene ~ cluster,
+                         data = hec_deg  ,
+                         OrgDb = "org.Mm.eg.db",
+                   keyType = "SYMBOL",
+                   ont = "BP"
+                   )
+
+```
+##Scoring the cell substrate adhesion and focal adhesion gene sets
+```{r}
+focal_adhesion <- kegg_mmu$KEGGPATHID2EXTID %>% dplyr::filter(from=='mmu04510') %>% pull(to) %>% unique()  
+gene_info <- AnnotationDbi::select(org.Mm.eg.db, 
+                    keys = "GO:0031589", 
+                    columns = c("SYMBOL"), 
+                    keytype = "GOALL")
+cell_adhesion_genes <- unique(gene_info$SYMBOL)
+
+eht_all <- sub_combined[,sub_combined$celltype%in%c('AEC1','HEC','HSPC1')]
+eht_all %<>% NormalizeData() 
+eht_all$gGroup_celltype <- paste(eht_all$gGroup,eht_all$celltype,sep = '_')
+eht_all <- AddModuleScore(eht_all,
+                      features = list(cell_adhesion_genes),
+                      name = 'cell-substrate_adhesion')
+eht_all <- AddModuleScore(eht_all,
+                      features = list(focal_adhesion),
+                      name = 'focal_adhesion')
+
+VlnPlot2(eht_all, 
+         features = c('cell.substrate_adhesion1','focal_adhesion'), 
+         group.by = "celltype", 
+         split.by = 'gGroup_celltype',
+         stat.method = "wilcox.test", 
+         hide.ns = F)
+
+eht_tko <- eht_all[,eht_all$g_tGroup%in%c("gKO_tKO",'gCtrl_tCtrl')]
+eht_tko %<>% NormalizeData() 
+eht_tko$g_tGroup_celltype <- paste(eht_tko$g_tGroup,eht_tko$celltype,sep = '_')
+eht_tko <- AddModuleScore(eht_tko,
+                      features = list(cell_adhesion_genes),
+                      name = 'cell-substrate_adhesion')
+eht_tko <- AddModuleScore(eht_tko,
+                          features = list(focal_adhesion),
+                          name = 'focal_adhesion')
+
+VlnPlot2(eht_all, 
+         features = c('cell.substrate_adhesion1','focal_adhesion1'), 
+         group.by = "g_tGroup_celltype",
+         stat.method = "wilcox.test", 
+         hide.ns = F,pt = FALSE)+labs(title = 'cell.substrate_adhesion1')+scale_fill_manual(values = c('#1565C0', 
+  '#FF9800', 
+  '#E53935','#1565C0', 
+  '#FF9800', 
+  '#E53935'))
+
+
+VlnPlot2(eht_tko, 
+         features = c('cell.substrate_adhesion1','focal_adhesion1'), 
+         group.by = "g_tGroup_celltype",
+         stat.method = "wilcox.test", 
+         hide.ns = F,pt = FALSE)+labs(title = 'cell.substrate_adhesion1')+scale_fill_manual(values = c('#1565C0', 
+  '#FF9800', 
+  '#E53935','#1565C0', 
+  '#FF9800', 
+  '#E53935'))
+
+
+```
+##Cell cycle scoring
+```{r}
+eht_tko %<>% NormalizeData() %>% CellCycleScoring(s.features = cc.genes$s.genes %>% tolower() %>% Hmisc::capitalize(),g2m.features = cc.genes$g2m.genes %>% tolower() %>%Hmisc::capitalize())  
+pdf('tko_cellcylce.pdf',width = 5,height = 5)
+VlnPlot2(eht_tko[,eht_tko$celltype%in%c('HEC','HSPC1')], 
+         features =  c("S.Score","G2M.Score"), 
+         group.by = "celltype", 
+         split.by = 'g_tGroup',
+         stat.method = "wilcox.test", 
+         hide.ns = F,pt=F)+scale_fill_manual(values = c(
+  '#860162', '#795ff6') %>% rev())+black_border
+
+dev.off()
+```
+
+
+##Transcription Factor Regulation Analysis/Mycn target gene scoring and enrichment analysis
+```{r}
+##Predicted target gene
+wgcna_data <- sub_combined[,c(sub_combined$celltype%in%c('HEC','HSPC1')&sub_combined$g_tGroup%in%c('gCtrl_tCtrl','gKO_tKO'))]
+compute_mycn_network <- function(
+  seurat_obj, 
+  model_params, 
+  target_tf = "MYCN", 
+  nfold = 5, 
+  callbacks = NULL, 
+  wgcna_name = NULL
+) {
+
+  if (is.null(wgcna_name)) {
+    wgcna_name <- seurat_obj@misc$active_wgcna
+  }
+  CheckWGCNAName(seurat_obj, wgcna_name)
+  
+  motif_matrix <- GetMotifMatrix(seurat_obj)
+  motif_df <- GetMotifs(seurat_obj)
+  
+  if (is.null(motif_df) || !("gene_name" %in% colnames(motif_df))) {
+    stop("Motif info missing or 'gene_name' column not found.")
+  }
+
+  target_motif_ids <- motif_df %>% 
+    dplyr::filter(gene_name == target_tf) %>% 
+    .$motif_ID %>% unique()
+  
+  if (length(target_motif_ids) == 0) {
+    stop(paste("No motif found for", target_tf))
+  }
+
+  datExpr <- as.matrix(GetDatExpr(seurat_obj, wgcna_name = wgcna_name))
+  all_genes <- colnames(datExpr)
+  potential_targets <- rownames(motif_matrix)[rowSums(motif_matrix[, target_motif_ids, drop=FALSE]) > 0]
+  genes_use <- all_genes[all_genes %in% potential_targets]
+  genes_use <- setdiff(genes_use, target_tf)
+
+  if (is.null(callbacks)) {
+    callbacks = list(xgboost::cb.cv.predict(save_models = TRUE))
+  }
+
+  importance_df <- data.frame()
+  eval_df <- data.frame()
+  
+  pb <- utils::txtProgressBar(min = 0, max = length(genes_use), style = 3, width = 50, char = "=")
+
+  for (i in seq_along(genes_use)) {
+    cur_gene <- genes_use[i]
+    setTxtProgressBar(pb, i)
+    
+    cur_tfs_motifs <- names(which(motif_matrix[cur_gene, ]))
+    cur_tfs <- motif_df %>% 
+      dplyr::filter(motif_ID %in% cur_tfs_motifs & gene_name %in% all_genes) %>% 
+      .$gene_name %>% unique()
+    
+    cur_tfs <- unique(c(cur_tfs, target_tf))
+    cur_tfs <- setdiff(cur_tfs, cur_gene)
+    
+    if (length(cur_tfs) < 2) next
+
+    x_vars <- datExpr[, cur_tfs, drop=FALSE]
+    y_var <- as.numeric(datExpr[, cur_gene])
+    
+    if (all(y_var == 0)) next
+
+    tryCatch({
+      xgb <- xgboost::xgb.cv(
+        params = model_params, 
+        data = xgboost::xgb.DMatrix(x_vars, label = y_var), 
+        nrounds = 100, 
+        showsd = FALSE, 
+        nfold = nfold, 
+        callbacks = callbacks, 
+        verbose = FALSE
+      )
+
+      importance <- Reduce("+", lapply(1:nfold, function(j) {
+        cur_model <- xgb$models[[j]] 
+        imp <- xgboost::xgb.importance(feature_names = colnames(x_vars), model = cur_model)
+        full_imp <- data.frame(Feature = colnames(x_vars)) %>%
+          dplyr::left_join(imp, by = "Feature") %>%
+          dplyr::mutate(dplyr::across(where(is.numeric), ~replace_na(.x, 0)))
+        
+        return(as.matrix(full_imp[,-1]))
+      })) / nfold
+
+      importance <- as.data.frame(importance)
+      importance$tf <- colnames(x_vars)
+      importance$gene <- cur_gene
+      
+      tf_cor <- as.numeric(cor(x_vars, y_var))
+      importance$Cor <- tf_cor
+      
+      target_row <- subset(importance, tf == target_tf)
+      importance_df <- rbind(importance_df, target_row)
+
+      xgb_eval <- as.data.frame(xgb$evaluation_log)
+      xgb_eval$variable <- cur_gene
+      eval_df <- rbind(eval_df, xgb_eval)
+      
+    }, error = function(e) { message(paste("\nError in gene", cur_gene, ":", e$message)) })
+  }
+  close(pb)
+
+  seurat_obj <- SetTFNetwork(seurat_obj, importance_df, wgcna_name = wgcna_name)
+  seurat_obj <- SetTFEval(seurat_obj, eval_df, wgcna_name = wgcna_name)
+  
+  return(seurat_obj)
+}
+
+model_params <- list(
+    objective = 'reg:squarederror',
+    max_depth = 1,
+    eta = 0.1,
+    nthread=65,
+    alpha=0.5
+) 
+wgcna_data <- compute_mycn_network(
+  wgcna_data, 
+  model_params, 
+  target_tf = "Mycn", 
+  nfold = 5, 
+  callbacks = NULL, 
+  wgcna_name = NULL
+)
+
+model_params <- list(
+    objective = 'reg:squarederror',
+    max_depth = 1,
+    eta = 0.1,
+    nthread=65,
+    alpha=0.5
+)
+
+library(doParallel)
+registerDoParallel(cores = 65)
+wgcna_data <- ConstructTFNetwork(wgcna_data, model_params)
+wgcna_data <- AssignTFRegulons(
+    wgcna_data,
+    strategy = "A",
+    reg_thresh = 0,
+    n_tfs = 10
+)
+
+tf_network <- GetTFNetwork(wgcna_data)
+RegulonBarPlot(wgcna_data, selected_tf='Mycn',cutoff=0.2)
+
+mycn_target_neg <- wgcna_data@misc$tutorial$tf_net %>% dplyr::filter(tf=='Mycn'&Gain>0&Cor< -0.3) %>% arrange(desc(Gain))
+mycn_target_pos <- wgcna_data@misc$tutorial$tf_net %>% dplyr::filter(tf=='Mycn'&Gain>0&Cor> 0.3) %>% arrange(desc(Gain))
+
+
+hec <- sub_combined[,sub_combined$celltype%in%c('HEC')]
+hec <- NormalizeData(hec)
+hec <- AddModuleScore(hec,features = list(mycn_target_pos$gene),
+                            name = 'mycn_target_posotive')
+
+hec <- AddModuleScore(hec,features = list(mycn_target_neg$gene),
+                            name = 'mycn_target_negitive')
+
+
+
+
+hec_tctrl_tko <- hec_hspc1[,hec_hspc1$new_gtGroup%in%c('gCtrl_tCtrl','gKO_tKO')]
+hec_tctrl_tko %<>% NormalizeData() 
+hec_tctrl_tko <- AddModuleScore(hec_tctrl_tko,
+                            features = list(mycn_target_pos$gene),
+                            name = 'mycn_target_posotive')
+
+hec_tctrl_tko <- AddModuleScore(hec_tctrl_tko,
+                            features = list(mycn_target_neg$gene),
+                            name = 'mycn_target_negitive')
+
+##plotting
+VlnPlot2(hec, 
+         features = 'mycn_target_posotive1', 
+         group.by = "celltype", 
+         split.by = 'gGroup',
+         stat.method = "wilcox.test", 
+         hide.ns = F,pt = F)+labs(title = 'mycn_target_posotive')+scale_fill_manual(values = c('#549ffa','#f84040'))+black_border+VlnPlot2(hec_tctrl_tko, 
+         features = 'mycn_target_posotive1', 
+         group.by = "celltype", 
+         split.by = 'g_tGroup',
+         stat.method = "wilcox.test", 
+         hide.ns = F,pt = F)+labs(title = 'mycn_target_posotive')+scale_fill_manual(values = c('#795ff6','#860162'))+black_border
+
+
+VlnPlot2(hec_tctrl_tko, 
+         features = c('mycn_target_posotive1','mycn_target_negitive1'), 
+         group.by = "new_gtGroup",
+         stat.method = "wilcox.test", 
+         hide.ns = F)
+
+VlnPlot2(hec, 
+         features = 'mycn_target_negitive1', 
+         group.by = "celltype", 
+         split.by = 'gGroup',
+         stat.method = "wilcox.test", 
+         hide.ns = F,pt = F)+labs(title = 'mycn_target_posotive')+scale_fill_manual(values = c('#549ffa','#f84040'))+black_border+VlnPlot2(hec_tctrl_tko, 
+         features = 'mycn_target_negitive1', 
+         group.by = "celltype", 
+         split.by = 'g_tGroup',
+         stat.method = "wilcox.test", 
+         hide.ns = F,pt = F)+labs(title = 'mycn_target_posotive')+scale_fill_manual(values = c('#795ff6','#860162'))+black_border
+
+
+```
+
+##Network graph visualization
+```{r}
+mycn_target_go <- enrichGO(gene=c(mycn_target_neg$gene,mycn_target_pos$gene) %>% unique(),
+                        keyType='SYMBOL',
+                        ont = 'BP',
+                        OrgD = "org.Mm.eg.db"
+                        )
+
+mycn_target_go_result <- mycn_target_go@result
+mycn_target_filter <- mycn_target_go_result[c(1,9,10,11,12,19,23,29,30,71,78),]#Identification of distinct significantly enriched biological process terms
+
+library(tidyverse)
+library(tidygraph)
+library(ggraph)
+
+edges <- mycn_target_filter %>%
+  select(Description, geneID) %>%
+  separate_rows(geneID, sep = "/") %>%
+  rename(from = Description, to = geneID)
+
+all_nodes <- unique(c(edges$from, edges$to))
+
+nodes_df <- data.frame(name = all_nodes) %>%
+  mutate(
+    is_pathway = name %in% mycn_target_filter$Description,
+    node_type = ifelse(is_pathway, "Pathway", "Gene"),
+    reg_status = case_when(
+      is_pathway ~ "Pathway Center",
+      name %in% mycn_target_pos$gene ~ "Positive (Red)",
+      name %in% mycn_target_neg$gene ~ "Negative (Blue)",
+      TRUE ~ "Neutral (Grey)"
+    )
+  )
+
+
+graph_data <- tbl_graph(nodes = nodes_df, edges = edges, directed = FALSE)
+
+library(ggraph)
+library(ggplot2)
+
+pdf('../../project/mycn_data/filter_data/fig/target_mycn.pdf',width = 8,height = 6)
+seed(123)
+ggraph(graph_data, layout = "fr") + 
+  
+  geom_edge_link(alpha = 0.2, color = "black", width = 0.5) + 
+  
+  
+  geom_node_point(aes(color = reg_status, size = node_type)) + 
+  
+  
+  geom_node_text(aes(label = name, filter = is_pathway), 
+                 repel = TRUE, fontface = "bold", size = 3) +
+  
+  geom_node_text(
+    aes(label = name, filter = !is_pathway), 
+    repel = TRUE, 
+    size = 3.5,            
+    fontface = "italic",  
+    color = "grey20",      
+    max.overlaps = 20
+  ) +
+
+  scale_color_manual(values = c(
+    "Pathway Center" = "#f9b256", 
+    "Positive (Red)" = "#dd522a", 
+    "Negative (Blue)" = "#0e7ca2",
+    "Neutral (Grey)" = "#DDDDDD"
+  )) +
+  
+  scale_size_manual(values = c("Pathway" = 7, "Gene" = 4)) +
+  
+  theme_void() + 
+  theme(legend.position = "right") +
+  labs(
+    title = "Gene-Pathway Connection Network",
+    subtitle = "Visualizing MYCN targets across functional modules",
+    color = "Regulation & Role", 
+    size = "Node Type"
+  )
+dev.off()
+
+```
+
+#Y15 single-cell data QC, dimensionality reduction and clustering
+```{r}
+setwd("/mnt/dataset/chenzhe/mmyy/y15/KYSY-19274_JD-KYFW-202403-0308-JSFW")
+folders = c("out_251132A_KO", "out_251132A_KY", "out_251132A_WT", "out_251132A_WY")
+sceList = lapply(folders, function(f){
+  path = paste0(f, "/outs/filtered_feature_bc_matrix/")
+  counts = Read10X(data.dir = path)
+  obj = CreateSeuratObject(counts = counts, 
+                           project = f, 
+                           min.cells = 3, 
+                           min.features = 200)
+  return(obj)
+})
+names(sceList) = folders
+combined <- merge(x = sceList[[1]], y = sceList[-1], 
+                       add.cell.ids =folders)
+                       
+combined[["percent.mt"]] <- PercentageFeatureSet(combined, pattern = "^mt-")
+merge_split_filter <- subset(merge_split,nFeature_RNA>1000&nCount_RNA<100000&percent.mt<10)
+merge_split_filter %<>% NormalizeData() %>% FindVariableFeatures() %>%  ScaleData() %>% RunPCA() %>% RunUMAP(dims = 1:30) %>% FindNeighbors(dims = 1:30) %>% FindClusters(resolution = 0.2)
+sweep.res <- paramSweep_v3(merge_split_filter, PCs = 1:20)
+sweep.stats_object <- summarizeSweep(sweep.res, GT = FALSE)
+bcmvn <- find.pK(sweep.stats_object)
+pK_bcmvn <- bcmvn$pK[which.max(bcmvn$BCmetric)] %>% as.numeric()
+pK_bcmvn <- as.numeric(bcmvn$pK[which.max(bcmvn$BCmetric)])
+annotations <- merge_split_filter@meta.data$RNA_snn_res.0.2
+homotypic.prop <- modelHomotypic(annotations)
+nExp_poi <- round(0.07 * nrow(merge_split_filter@meta.data))
+nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+merge_split_filter <- doubletFinder_v3(merge_split_filter, PCs = 1:20, pN = 0.25, pK = pK_bcmvn,
+                                  nExp = nExp_poi.adj, reuse.pANN = FALSE, sct = F)
+mycn_seu_new_filter <- merge_split_filter[,merge_split_filter$DF.classifications_0.25_3_614%in%'Singlet']
+counts <- mycn_seu_new_filter@assays$RNA@counts
+decontX_results <- decontX(counts)
+mycn_seu_new_filter$Contamination <- mycn_seu_new_filter$contamination
+y15_obj <- subset(mycn_seu_new_filter,Contamination<0.75)
+y15_obj %<>% NormalizeData() %>% FindVariableFeatures() %>% RunHarmony('g_Group') %>% 
+FindNeighbors(y15_obj,reduction = 'harmony',dims = 1:5) %>% FindClusters(resolution = 0.3)
+y15_obj <- FindSubCluster(y15_obj,cluster = '0',subcluster.name = 'hspc_new',graph.name = 'RNA_snn',resolution = 0.1)
+y15_obj$final_cluster <- plyr::mapvalues(y15_obj$hspc_new,
+                                           from = y15_obj$hspc_new %>% unique(),
+                                           to=c('Mast cell','Mac','HSPC2','Mye Prog.','EC','EC','Mac','MK','Ery','HSPC1','MK','Granulocyte'))
+
+y15_obj$final_cluster <- factor(y15_obj$final_cluster,levels = c('EC','HSPC1','HSPC2','Mye Prog.','Mast cell','Granulocyte','Mac','MK','Ery'))
+DotPlot(y15_obj,features = c('Pecam1','Cd44','Cdh5','Unc5b','Dll4','Gja5','Mecom','Hlf','Runx1','Ptprc','Prtn3','Fcgr3','Spi1','Kit','Cd34','Cpa3','Hdc','S100a8','S100a9','Cd86','C1qa','C1qb','Gp9','Gp5','Itga2b','Gata1','Klf1','Car2') %>% unique(),scale = F,group.by = 'final_cluster')+RotatedAxis()+scale_color_gradientn(colors = c("#D3D3D3", "#FF8C00", "#FF0000", "#8B0000"))+black_border
+
+
+##Runx1HE
+runx1_expr <- FetchData(y15_obj,vars = 'Runx1')
+cdh5_expr <- FetchData(y15_obj,vars = 'Cdh5')
+ptprc_expr <- FetchData(y15_obj,vars = 'Ptprc')
+y15_obj@meta.data[rownames(runx1_expr),'runx1'] <- runx1_expr[rownames(runx1_expr),'Runx1']
+y15_obj@meta.data[rownames(cdh5_expr),'cdh5'] <- cdh5_expr[rownames(cdh5_expr),'Cdh5']
+y15_obj@meta.data[rownames(ptprc_expr),'Ptprc'] <- ptprc_expr[rownames(ptprc_expr),'Ptprc']
+y15_obj$HE <- ifelse(y15_obj$runx1>0&y15_obj$cdh5>0&y15_obj$Ptprc==0,'HE','others')
+
+ec_hspc1_new <- y15_obj[,y15_obj$final_cluster%in%c('EC','HSPC1')]
+ec_hspc1_new <- ec_hspc1_new %>% NormalizeData() %>% FindVariableFeatures(nfeatures = 1000) %>% 
+  ScaleData(vars.to.regress = c('S.Score','G2M.Score')) %>%  
+  RunPCA() #%>% RunHarmony()
+
+ec_hspc1_new %<>%  RunUMAP(reduction = 'pca',dims = 1:3, min.dist = 0.5)
+pdf('../mycn_new/sub_umap.pdf',width = 10,height = 4)
+DimPlot(ec_hspc1_new,reduction = 'umap',group.by = 'final_cluster',cols = c("#42a4f5","#e43935"),pt.size = 1)+black_border|DimPlot(ec_hspc1_new,reduction = 'umap',group.by = 'HE',cols = c('red','grey'),pt.size = 1)+black_border
+dev.off()
+
+
+
+```
+##GO enrichment analysis
+```{r}
+diff_enrich <- function(seurat_obj, ident1 = "KY", ident2 = "KO", 
+                        logfc_thresh = log2(1.3), pval_thresh = 0.05, 
+                        organism = "mmu", ont = "BP") {
+  deg <- FindMarkers(seurat_obj, ident.1 = ident1, ident.2 = ident2, 
+                     logfc.threshold = logfc_thresh) %>%
+    filter(p_val < pval_thresh) %>%
+    mutate(cluster = ifelse(avg_log2FC > 0, ident1, ident2),
+           gene = rownames(.))
+  deg_counts <- deg %>%
+    count(cluster) %>%
+    mutate(cluster = factor(cluster, levels = c(ident2, ident1)))  
+  
+  deg_plot <- ggplot(deg_counts, aes(x = cluster, y = n, fill = cluster)) +
+    geom_col(color = "black", width = 0.7) +
+    scale_fill_manual(values = c("KO" = "#E31A1C", "KY" = "#1F78B4")) + 
+    labs(title = "Number of differentially expressed genes", x = "Group", y = "gene counts") +
+    theme_minimal() +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5))
+  
+  # GO enrichment
+  go_res <- compareCluster(gene ~ cluster, data = deg, OrgDb = "org.Mm.eg.db",
+                           keyType = "SYMBOL", ont = ont)
+  return(list(DEG = deg, GO = go_res,DEG_plot = deg_plot))
+}
+
+library(clusterProfiler)
+he <- y15_new[,y15_new$Cluster%in%'EC'&y15_new$HE%in%'HE']
+he %<>%NormalizeData() 
+Idents(he) <- he$g_Group
+ky_wy_results <- diff_enrich(he, ident1 = "KY", ident2 = "WY", 
+                        logfc_thresh =  log2(1.2), pval_thresh = 0.05, 
+                        organism = "mmu", ont = "BP")
+
+ko_wt_results <- diff_enrich(he, ident1 = "KO", ident2 = "WT", 
+                        logfc_thresh = log2(1.3), pval_thresh = 0.05, 
+                        organism = "mmu", ont = "BP")
+
+ky_wt_results <- diff_enrich(he, ident1 = "KY", ident2 = "WT", 
+                        logfc_thresh = log2(1.3), pval_thresh = 0.05, 
+                        organism = "mmu", ont = "BP")
+ky_ko_results <- diff_enrich(he, ident1 = "KY", ident2 = "KO", 
+                        logfc_thresh = 0.25, pval_thresh = 0.05, 
+                        organism = "mmu", ont = "BP")
+
+wy_wt_results <- diff_enrich(he, ident1 = "WY", ident2 = "WT", 
+                        logfc_thresh = log2(1.2), pval_thresh = 0.05, 
+                        organism = "mmu", ont = "BP")
+
+```
+##Cell cycle scoring
+```{r}
+
+he %<>% NormalizeData() %>%  CellCycleScoring(s.features = cc.genes$s.genes %>% tolower() %>% Hmisc::capitalize(),g2m.features = cc.genes$g2m.genes %>% tolower() %>%Hmisc::capitalize())
+VlnPlot2(he, 
+         features =  c("S.Score","G2M.Score"), 
+         group.by   = "g_Group",stat.method="wilcox.test",
+         hide.ns = F,pt=F)+scale_fill_manual(values = c('#549ffa','#459298','#f84040','#ecafcb'))+black_border
+
+hspc1 %<>% NormalizeData() %>%  CellCycleScoring(s.features = cc.genes$s.genes %>% tolower() %>% Hmisc::capitalize(),g2m.features = cc.genes$g2m.genes %>% tolower() %>%Hmisc::capitalize())
+VlnPlot2(hspc1, 
+         features =  c("S.Score","G2M.Score"), 
+         group.by   = "g_Group",stat.method="wilcox.test",
+         hide.ns = F,pt=F)+scale_fill_manual(values = c('#549ffa','#459298','#f84040','#ecafcb'))+black_border
+
+```
+##GSEA analysis and its visualization
+```{r}
+library(org.Mm.eg.db)
+library(clusterProfiler)
+library(dplyr)
+go_genes <- AnnotationDbi::select(org.Mm.eg.db, 
+                                  keys = "GO:0031589", 
+                                  keytype = "GOALL", 
+                                  columns = "SYMBOL") %>% 
+            pull(SYMBOL) %>% unique()
+
+
+kegg_genes <- kegg_mmu$KEGGPATHID2EXTID %>% 
+              filter(from == "mmu04510") %>% 
+              pull(to)
+
+custom_gs <- data.frame(
+  term = c(rep("cell-substrate adhesion", length(go_genes)), 
+           rep("Focal_Adhesion", length(kegg_genes))),
+  gene = c(go_genes, kegg_genes)
+)
+
+
+comparisons <- list(
+  c("KY", "WY"), c("KO", "WT"), c("KY", "WT"), c("KY", "KO"), c("WY", "WT")
+)
+
+
+specific_gsea_results <- list()
+
+for (comp in comparisons) {
+  comp_name <- paste0(comp[1], "_vs_", comp[2])
+  
+  
+  deg <- FindMarkers(he, ident.1 = comp[1], ident.2 = comp[2], logfc.threshold = 0, min.pct = 0)
+  gene_list <- sort(setNames(deg$avg_log2FC, rownames(deg)), decreasing = TRUE)
+  
+  
+  res <- GSEA(geneList = gene_list, 
+              TERM2GENE = custom_gs, 
+              pvalueCutoff = 1, 
+              minGSSize = 1, 
+              maxGSSize = 1000)
+  
+  specific_gsea_results[[comp_name]] <- res
+}
+
+
+enrichplot::gseaplot2(
+ specific_gsea_results$KO_vs_WT,
+  geneSetID = 'Focal_Adhesion', 
+  title = "KO vs WT(NES = 1.495801)",
+  color = "red",
+  pvalue_table = TRUE
+)|enrichplot::gseaplot2(
+ specific_gsea_results$KO_vs_WT,
+  geneSetID = 'cell-substrate adhesion', 
+  title = "KO vs WT(NES = 1.385164)",
+  color = "red",
+  pvalue_table = TRUE
+)
+```
+
+
+```{r}
+he <- y15_obj[,y15_obj$celltype]
+
+table(y15_obj$HE,y15_obj$celltype)
+y15_obj$HE
+he <- y15_obj[,c(y15_obj$celltype%in%'EC'&y15_obj$HE%in%'HE')]
+
+
+Idents(he) <- he$g_Group
+library(org.Mm.eg.db)
+library(clusterProfiler)
+library(dplyr)
+go_genes <- AnnotationDbi::select(org.Mm.eg.db, 
+                                  keys = "GO:0042254", 
+                                  keytype = "GOALL", 
+                                  columns = "SYMBOL") %>% 
+            pull(SYMBOL) %>% unique()
+
+
+custom_gs <- data.frame(
+  term = c(rep("ribosome biogenesis", length(go_genes))),
+  gene = c(go_genes)
+)
+
+
+comparisons <- list(
+  c("KY", "WY"), c("KO", "WT"), c("KY", "WT"), c("KY", "KO"), c("WY", "WT")
+)
+
+
+specific_gsea_results <- list()
+
+for (comp in comparisons) {
+  comp_name <- paste0(comp[1], "_vs_", comp[2])
+  
+  
+  deg <- FindMarkers(he, ident.1 = comp[1], ident.2 = comp[2], logfc.threshold = 0, min.pct = 0)
+  gene_list <- sort(setNames(deg$avg_log2FC, rownames(deg)), decreasing = TRUE)
+  
+  
+  res <- GSEA(geneList = gene_list, 
+              TERM2GENE = custom_gs, 
+              pvalueCutoff = 1, 
+              minGSSize = 1, 
+              maxGSSize = 1000)
+  
+  specific_gsea_results[[comp_name]] <- res
+}
+
+specific_gsea_results$KY_vs_KO@result
+```
+
+
+```{r fig.width=4.5,fig.height=10}
+p1 <- enrichplot::gseaplot2(
+  specific_gsea_results$KY_vs_WT,
+  geneSetID = 'ribosome biogenesis', 
+  title = "cKO_Y15 vs Ctrl(NES =-2.054381)",
+  color = "red",
+  pvalue_table = TRUE
+)
+
+p2 <- enrichplot::gseaplot2(
+  specific_gsea_results$KO_vs_WT,
+  geneSetID = 'ribosome biogenesis', 
+  title = "cKO vs Ctrl(NES =-2.016914)",
+  color = "red",
+  pvalue_table = TRUE
+)
+
+p3 <- enrichplot::gseaplot2(
+  specific_gsea_results$KY_vs_KO,
+  geneSetID = 'ribosome biogenesis', 
+  title = "cKO_Y15 vs cKO(NES =1.09996)",
+  color = "red",
+  pvalue_table = TRUE
+)
+
+library(cowplot)
+pdf('/data/ccz/project/mycn_seu/revise_data/revised_fig/gsea_ribosome.pdf',width = 4.5,height = 10)
+plot_grid(p1,p2, p3, ncol = 1)
+dev.off()
+
+
+```
+```{r  fig.width=5,fig.height=10}
+
+p1 <- enrichplot::gseaplot2(
+  specific_gsea_results$KY_vs_WT,
+  geneSetID = 'ribosome biogenesis', 
+  title = "cKO_Y15 vs Ctrl(NES =-2.054381)",
+  color = "red",
+  subplots = 1:2,
+  pvalue_table = TRUE
+)
+
+p2 <- enrichplot::gseaplot2(
+  specific_gsea_results$KO_vs_WT,
+  geneSetID = 'ribosome biogenesis', 
+  title = "cKO vs Ctrl(NES =-2.016914)",
+  color = "red",
+  subplots = 1:2,
+  pvalue_table = TRUE
+)
+
+p3 <- enrichplot::gseaplot2(
+  specific_gsea_results$KY_vs_KO,
+  geneSetID = 'ribosome biogenesis', 
+  title = "cKO_Y15 vs cKO(NES =1.09996)",
+  color = "red",
+  subplots = 1:2,
+  pvalue_table = T
+)
+
+
+```
+
+```{r fig.width=6,fig.height=9}
+library(ggplot2)
+library(patchwork)
+p1 <- enrichplot::gseaplot2(
+  specific_gsea_results$KY_vs_WT,
+  geneSetID = 'ribosome biogenesis', 
+  title = "cKO_Y15 vs Ctrl(NES =-2.054381)",
+  color = "red",
+  subplots = 1:2,
+  pvalue_table = TRUE
+)
+
+p1[[1]] <- p1[[1]] + 
+  geom_hline(yintercept = 0, linetype = "solid", color = "grey50", linewidth = 0.5)
+
+
+p2 <- enrichplot::gseaplot2(
+  specific_gsea_results$KO_vs_WT,
+  geneSetID = 'ribosome biogenesis', 
+  title = "cKO vs Ctrl(NES =-2.016914)",
+  color = "red",
+  subplots = 1:2,
+  pvalue_table = TRUE
+)
+
+p2[[1]] <- p2[[1]] + 
+  geom_hline(yintercept = 0, linetype = "solid", color = "grey50", linewidth = 0.5)
+
+
+p3 <- enrichplot::gseaplot2(
+  specific_gsea_results$KY_vs_KO,
+  geneSetID = 'ribosome biogenesis', 
+  title = "cKO_Y15 vs cKO(NES =1.09996)",
+  color = "red",
+  subplots = 1:2,
+  pvalue_table = TRUE
+)
+
+p3[[1]] <- p3[[1]] + 
+  geom_hline(yintercept = 0, linetype = "solid", color = "grey50", linewidth = 0.5)
+
+
+combined_plot <- wrap_elements(p1) / wrap_elements(p2) / wrap_elements(p3)
+
+pdf('/data/ccz/project/mycn_seu/revise_data/revised_fig/gsea_ribosome.pdf', width = 4.5, height = 10)
+print(combined_plot)
+dev.off() 
+```
+
+```{r}
+library(ggplot2)
+library(patchwork)
+
+p1 <- enrichplot::gseaplot2(
+  specific_gsea_results$KY_vs_WT,
+  geneSetID = 'ribosome biogenesis', 
+  title = "cKO_Y15 vs Ctrl",
+  color = "red",
+  pvalue_table = TRUE
+)
+
+p1[[1]] <- p1[[1]] + 
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", size = 0.5) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.2, vjust = 2, 
+           label = "NES = -2.05", size = 4.5, fontface = "bold")
+
+p1[[3]] <- p1[[3]] + 
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", size = 0.5)
+
+combined_plot <- wrap_elements(p1) 
+
+pdf('gsea_ribosome.pdf', width = 5, height = 12)
+print(combined_plot)
+dev.off()
+
+
+save(specific_gsea_results,file = './revised_fig/gse_ribosome_result.RData')
+```
+
+
+
