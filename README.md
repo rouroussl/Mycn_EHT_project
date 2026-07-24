@@ -11,6 +11,6 @@ These BED files define the specific genomic regions of the *Mycn* gene used for 
 
 ### 3. Processed Data Objects (.rds)
 These are fully processed Seurat objects (R data format) ready for downstream exploration and figure reproduction:
-*   **`sub_combined.rds`**: Processed scRNA-seq Seurat object corresponding to the analysis and visualization presented in **Supplemental Fig 2A**.
+*   **`major_seu.rds`**: Processed scRNA-seq Seurat object corresponding to the analysis and visualization presented in **Fig 3B**.
+*   **`bm_seu.rds`**: Processed scRNA-seq Seurat object of donor bone marrow LSK (Lin⁻Sca1⁺c-Kit⁺) cells visualization presented in **Supplemental Fig 4B**.
 *   **`y15_obj.rds`**: Processed scRNA-seq Seurat object corresponding to the analysis and visualization presented in **Supplemental Fig 5A**.
-*   **`bm_seu.rds`**: Processed scRNA-seq Seurat object of donor bone marrow LSK (Lin⁻Sca1⁺c-Kit⁺) cells.
