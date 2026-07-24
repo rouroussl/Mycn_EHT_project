@@ -145,7 +145,7 @@ new_sample_combined$genotype <- ifelse(new_sample_combined$hash.ID%in%c("E10-KO"
 new_sample_combined$batch <- '3_10X'
 
 ```
-#Integrating multi-omics data for batch correction, dimensionality reduction, and clustering
+#Integrating multi data for batch correction, dimensionality reduction, and clustering
 
 ```{r}
 all_dat <- merge(new_sample_combined,y=list(mycn_dou,mycn))
@@ -187,38 +187,19 @@ sub_combined$Cluster <- plyr::mapvalues(sub_combined$hspc.cluster,
 sub_combined$Cluster <- factor(sub_combined$Cluster,levels = c('VEC','AEC2','AEC1','HEC','HSPC1','HSPC2','Lym prog.','Mye prog.','Mac','MK'))
 ```
 
-##Compare the difference in HSPC1 numbers
 ```{r}
-counts_matrix <- matrix(
-  c( 636, 136, 127,   #Ctrl
-     812, 199, 114), #KO
-  nrow = 2,
-  byrow = TRUE
-)
-rownames(counts_matrix) <- c("Ctrl", "KO")
-colnames(counts_matrix) <- c("AEC1", "HEC", "HSPC1")
-
-target_cell <- "HSPC1"
-target_counts <- counts_matrix[, target_cell]       
-total_counts <- rowSums(counts_matrix)              
-other_counts <- total_counts - target_counts        
-
-test_data <- cbind(Target = target_counts, Others = other_counts)
-
-colnames(test_data)[1] <- target_cell 
-chisq_res <- chisq.test(test_data)
-
-
+library(magrittr)
+sub_data <- sub_combined[,!(sub_combined$celltype%in%c("VEC","AEC2",'Mac',"MK"))]
+DefaultAssay(sub_data) <- "integrated"
+sub_major %<>% RunUMAP(dims = 1:40,min.dist = 0.5,n.neighbors =30)
 ```
-
-
 
 ##monocle
 ```{r}
 library(monocle)
 library(Seurat)
 library(dplyr)
-eht <- sub_combined[,sub_combined$celltype%in%c('HEC','HSPC1')]
+eht <- sub_major[,sub_major$celltype%in%c('HEC','HSPC1')]
 eht %<>% NormalizeData()
 p_data <- eht@meta.data
 # 提取基因信息
@@ -293,7 +274,7 @@ ggplot(plot_df, aes(x = Pseudotime, fill = gGroup)) +
 
 ##Visualizing single-cell knockout proportions
 ```{r fig.width=4,fig.height=5}
-eht <- sub_combined[,c(sub_combined$celltype%in%c('AEC1','HEC','HSPC1')&sub_combined$pick%in%c('tCtrl','tHT','tKO'))]
+eht <- sub_major[,c(sub_major$celltype%in%c('AEC1','HEC','HSPC1')&sub_major$pick%in%c('tCtrl','tHT','tKO'))]
 table(eht$gGroup,eht$new_gtGroup)
 
 plot_data <- eht@meta.data %>% 
@@ -321,8 +302,8 @@ ggplot(plot_data, aes(x = gGroup, y = Percent, fill = pick)) +
 ```
 ##HEC enrichment analysis
 ```{r}
-Idents(sub_combined) <- sub_combined$g_tGroup
-hec_data <- sub_combined[,c(sub_combined$Cluster%in%'HEC'&sub_combined$g_tGroup%in%c('gKO_tKO','gCtrl_tCtrl'))]
+Idents(sub_major) <- sub_major$g_tGroup
+hec_data <- sub_major[,c(sub_major$Cluster%in%'HEC'&sub_major$g_tGroup%in%c('gKO_tKO','gCtrl_tCtrl'))]
 hec_data %<>% NormalizeData() 
 Idents(hec_data) <- hec_data$g_tGroup
 hec_deg <- FindMarkers(hec_data,ident.1 = 'gKO_tKO',ident.2 = 'gCtrl_tCtrl',logfc.threshold = log(1.3)) %>% dplyr::filter(p_val<0.05)
@@ -345,7 +326,7 @@ gene_info <- AnnotationDbi::select(org.Mm.eg.db,
                     keytype = "GOALL")
 cell_adhesion_genes <- unique(gene_info$SYMBOL)
 
-eht_all <- sub_combined[,sub_combined$celltype%in%c('AEC1','HEC','HSPC1')]
+eht_all <- sub_major[,sub_major$celltype%in%c('AEC1','HEC','HSPC1')]
 eht_all %<>% NormalizeData() 
 eht_all$gGroup_celltype <- paste(eht_all$gGroup,eht_all$celltype,sep = '_')
 eht_all <- AddModuleScore(eht_all,
@@ -414,7 +395,7 @@ dev.off()
 ##Transcription Factor Regulation Analysis/Mycn target gene scoring and enrichment analysis
 ```{r}
 ##Predicted target gene
-wgcna_data <- sub_combined[,c(sub_combined$celltype%in%c('HEC','HSPC1')&sub_combined$g_tGroup%in%c('gCtrl_tCtrl','gKO_tKO'))]
+wgcna_data <- sub_major[,c(sub_major$celltype%in%c('HEC','HSPC1')&sub_major$g_tGroup%in%c('gCtrl_tCtrl','gKO_tKO'))]
 compute_mycn_network <- function(
   seurat_obj, 
   model_params, 
@@ -564,7 +545,7 @@ mycn_target_neg <- wgcna_data@misc$tutorial$tf_net %>% dplyr::filter(tf=='Mycn'&
 mycn_target_pos <- wgcna_data@misc$tutorial$tf_net %>% dplyr::filter(tf=='Mycn'&Gain>0&Cor> 0.3) %>% arrange(desc(Gain))
 
 
-hec <- sub_combined[,sub_combined$celltype%in%c('HEC')]
+hec <- sub_major[,sub_major$celltype%in%c('HEC')]
 hec <- NormalizeData(hec)
 hec <- AddModuleScore(hec,features = list(mycn_target_pos$gene),
                             name = 'mycn_target_posotive')
